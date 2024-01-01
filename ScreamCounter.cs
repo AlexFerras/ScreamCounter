@@ -1,25 +1,17 @@
 ﻿using BepInEx;
-using HarmonyLib;
-using System;
-using System.Numerics;
-using System.Runtime.CompilerServices;
-using UnityEngine;
-using Unity.Netcode;
-using LC_API.GameInterfaceAPI.Features;
-using LC_API.GameInterfaceAPI.Events.Patches.Internal;
+using BepInEx.Configuration;
 using Dissonance;
+using GameNetcodeStuff;
+using HarmonyLib;
+using LC_API.GameInterfaceAPI.Features;
+using Network;
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Collections;
-using GameNetcodeStuff;
-using Network;
-using BepInEx.Logging;
-using System.Reflection.Emit;
-using UnityEngine.Analytics;
-using System.IO;
-using LC_API.BundleAPI;
-using BepInEx.Configuration;
+using Unity.Netcode;
+using UnityEngine;
 
 namespace Network
 {
@@ -81,13 +73,9 @@ namespace Network
         }
 
         [ServerRpc(RequireOwnership = false)]
-        public void AddToScreamCounterServerRpc(NetworkBehaviourReference playerref, float amplitudeDiv)
+        public void AddToScreamCounterServerRpc(NetworkBehaviourReference playerref)
         {
             playerref.TryGet(out PlayerControllerB player);
-
-            if (amplitudeDiv < 3f * ScreamCounter.ScreamCounter.configRequiredAmplitude.Value)
-                return;
-
 
             if (ScreamCounter.ScreamCounter.currentPerPlayerScreams.ContainsKey(player))
                 ScreamCounter.ScreamCounter.currentPerPlayerScreams[player] = ScreamCounter.ScreamCounter.currentPerPlayerScreams[player] + 1;
@@ -123,7 +111,7 @@ namespace ScreamCounter
         private const string modName = "ScreamCounter";
         private const string modVersion = "1.0.0";
 
-        public static ConfigEntry<float> configRequiredAmplitude;
+        public static ConfigEntry<float> screamFromAveragePercentage;
 
 
         private Harmony harmony = new Harmony("frsk.Scream_Counter");
@@ -133,8 +121,10 @@ namespace ScreamCounter
         public static int screamCounter = 0;
         public static int averageCount = 0;
         public static float averageSpeechAmplitude;
+        public static float totalSpeechAmplitude;
         public static int currentPlayerCheck = 0;
         public static float screamCooldown = 0f;
+        public static float averageDetectCooldown = 0f;
         public static bool corRunning = false;
 
         public static Dictionary<PlayerControllerB, int> currentPerPlayerScreams = new Dictionary<PlayerControllerB, int>();
@@ -147,7 +137,7 @@ namespace ScreamCounter
                 Instance = this;
             }
 
-            configRequiredAmplitude = Config.Bind("General", "RequiredAmplitudePercentage", 2f, "");
+            screamFromAveragePercentage = Config.Bind("General", "ScreamFromAveragePercentage", 1.5f, "");
 
             int[] ints = new int[0];
 
@@ -228,36 +218,50 @@ namespace ScreamCounter
             [HarmonyPostfix]
             static void DetectVoiceChatAmplitudePatch(ref StartOfRound __instance)
             {
-
-/*                Debug.Log("Average local amplitude: " + __instance.averageVoiceAmplitude);
-                Debug.Log("averageCountMoving: " + __instance.movingAverageLength);
-                Debug.Log("averageCount" + __instance.averageCount);*/
-
-
                 var pc = GameNetworkManager.Instance.localPlayerController;
 
                 if (pc == null)
                     throw new Exception("pc is null");
 
-                if (pc.isPlayerDead || !__instance.shipHasLanded)
-                    return;
+                var cd = Traverse.Create(__instance).Field<float>("voiceChatNoiseCooldown").Value;
 
                 var vs = __instance.voiceChatModule.FindPlayer(__instance.voiceChatModule.LocalPlayerName);
 
-                   
+                var dontAppendAverage = false;
 
-                if (screamCooldown > 0.0f)
+                float num = vs.Amplitude / Mathf.Clamp(__instance.averageVoiceAmplitude, 0.008f, 0.5f);
+                if (!(vs.IsSpeaking && averageDetectCooldown <= 0f && num > 3f))
+                    dontAppendAverage = true;
+                    
+                
+                if (averageCount > 5 && !pc.isPlayerDead && __instance.shipHasLanded && screamCooldown <= 0.0f)
+                {
+                    if (vs.Amplitude / averageSpeechAmplitude > screamFromAveragePercentage.Value)
+                    {
+                        CustomNetworkHandler.Instance.AddToScreamCounterServerRpc(pc);
+                        screamCooldown = 10f;
+                        dontAppendAverage = true;
+                    }
+                        
+                }
+                else if (screamCooldown > 0.0f)
                 {
                     screamCooldown -= Time.deltaTime;
-                    return;
                 }
 
-                float n = vs.Amplitude / Mathf.Clamp(__instance.averageVoiceAmplitude, 0.008f, 0.5f);
-                if (n > 3f)
+                if (!dontAppendAverage)
                 {
-                    CustomNetworkHandler.Instance.AddToScreamCounterServerRpc(pc, n);
-                    screamCooldown = 10f;
+                    averageCount++;
+                    totalSpeechAmplitude += vs.Amplitude;
+                    averageSpeechAmplitude = totalSpeechAmplitude / averageCount;
+                    Debug.Log("Added amplitude to average. Current average: " + averageSpeechAmplitude);
+                    averageDetectCooldown = 2f;
                 }
+                averageDetectCooldown -= Time.deltaTime;
+
+
+
+
             }
 
             [HarmonyPatch("WritePlayerNotes")]
@@ -316,7 +320,7 @@ namespace ScreamCounter
             [HarmonyPrefix]
             static bool GetEndgameStatsInOrderPatch(ref StartOfRound __instance, ref int[] __result)
             {
-                __result = new int[5] { __instance.gameStats.daysSpent, __instance.gameStats.scrapValueCollected, __instance.gameStats.deaths, __instance.gameStats.allStepsTaken, screamCounter };
+                __result = [__instance.gameStats.daysSpent, __instance.gameStats.scrapValueCollected, __instance.gameStats.deaths, __instance.gameStats.allStepsTaken, screamCounter];
                 return false;
             }
         }
